@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Biometric Voting Admin</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="container">
+    <h1>Admin Dashboard</h1>
+
+    <section class="card" id="login-card">
+      <h2>Login</h2>
+      <input id="username" placeholder="Admin username" />
+      <input id="password" type="password" placeholder="Admin password" />
+      <button id="login-btn">Login</button>
+      <p class="hint" id="login-status"></p>
+    </section>
+
+    <section class="card" id="data-card" style="display:none">
+      <div class="row">
+        <button id="load-registrations">Load Registrations</button>
+        <button id="load-votes">Load Votes</button>
+      </div>
+
+      <h3>Registrations</h3>
+      <pre id="registrations"></pre>
+
+      <h3>Votes</h3>
+      <pre id="votes"></pre>
+    </section>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
