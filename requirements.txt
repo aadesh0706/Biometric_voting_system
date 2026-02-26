@@ -4,5 +4,6 @@ face_recognition
 numpy
 cmake
 dlib
-json
-pickle
+pickle5
+cryptography
+sqlite3
