@@ -9,6 +9,7 @@
     ],
     "android": {
       "permissions": [
+        "CAMERA",
         "USE_BIOMETRIC",
         "USE_FINGERPRINT"
       ],

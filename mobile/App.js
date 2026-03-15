@@ -12,10 +12,58 @@ import {
 } from "react-native";
 import * as LocalAuthentication from "expo-local-authentication";
 import AsyncStorage from "@react-native-async-storage/async-storage";
+import * as ImagePicker from "expo-image-picker";
+import * as ImageManipulator from "expo-image-manipulator";
 import config from "./config";
 
 const API_BASE = config.API_BASE_URL;
 const CANDIDATES = config.CANDIDATES;
+const REGISTER_EXPRESSIONS = config.REGISTRATION_EXPRESSIONS;
+
+const randomLivenessPrompts = () => {
+  const pool = [...config.LIVENESS_PROMPTS];
+  const count = Math.min(config.LIVENESS_STEPS, pool.length);
+  const prompts = [];
+
+  while (prompts.length < count) {
+    const index = Math.floor(Math.random() * pool.length);
+    prompts.push(pool.splice(index, 1)[0]);
+  }
+
+  return prompts.map((label, index) => ({ key: `live_${index}`, label }));
+};
+
+const buildImageFormField = (uri, name) => ({
+  uri,
+  name,
+  type: "image/jpeg",
+});
+
+const optimizeCaptureForUpload = async (uri) => {
+  const result = await ImageManipulator.manipulateAsync(
+    uri,
+    [{ resize: { width: 720 } }],
+    { compress: 0.55, format: ImageManipulator.SaveFormat.JPEG }
+  );
+  return result.uri;
+};
+
+const getErrorMessage = async (response) => {
+  try {
+    const data = await response.json();
+    return data.detail || data.message || "An error occurred.";
+  } catch (error) {
+    return "An error occurred.";
+  }
+};
+
+const getResponseData = async (response) => {
+  try {
+    return await response.json();
+  } catch (error) {
+    return null;
+  }
+};
 
 export default function App() {
   const [screen, setScreen] = useState("home");
@@ -26,10 +74,24 @@ export default function App() {
   const [loading, setLoading] = useState(false);
   const [authenticatedUser, setAuthenticatedUser] = useState(null);
   const [biometricSupported, setBiometricSupported] = useState(false);
+  const [authToken, setAuthToken] = useState("");
+  const [cameraFlow, setCameraFlow] = useState(null);
 
   useEffect(() => {
     checkBiometricSupport();
   }, []);
+
+  const fetchWithTimeout = async (url, options = {}) => {
+    const { timeoutMs, ...fetchOptions } = options;
+    const controller = new AbortController();
+    const requestTimeout = timeoutMs || config.REQUEST_TIMEOUT;
+    const timeoutId = setTimeout(() => controller.abort(), requestTimeout);
+    try {
+      return await fetch(url, { ...fetchOptions, signal: controller.signal });
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  };
 
   const checkBiometricSupport = async () => {
     const compatible = await LocalAuthentication.hasHardwareAsync();
@@ -68,6 +130,337 @@ export default function App() {
     }
   };
 
+  const ensureCameraAccess = async () => {
+    const existing = await ImagePicker.getCameraPermissionsAsync();
+    if (existing.granted) {
+      return true;
+    }
+
+    const permission = await ImagePicker.requestCameraPermissionsAsync();
+    if (!permission.granted) {
+      Alert.alert("Permission Required", "Camera permission is required for face verification.");
+      return false;
+    }
+
+    return true;
+  };
+
+  const startCameraFlow = async (type) => {
+    const hasPermission = await ensureCameraAccess();
+    if (!hasPermission) {
+      return;
+    }
+
+    const steps = type === "register" ? REGISTER_EXPRESSIONS : randomLivenessPrompts();
+    setCameraFlow({ type, stepIndex: 0, steps, capturedUris: [] });
+    setScreen("camera");
+  };
+
+  const syncLocalRegistrationCache = async (aadhaarNumber, nameValue) => {
+    await AsyncStorage.setItem(
+      `voter_${aadhaarNumber}`,
+      JSON.stringify({
+        name: nameValue || "Voter",
+        aadhaar: aadhaarNumber,
+        syncedAt: new Date().toISOString(),
+        mode: "face+liveness",
+      })
+    );
+  };
+
+  const checkRegistrationStatus = async (aadhaarNumber) => {
+    const response = await fetchWithTimeout(`${API_BASE}/registration-status/${aadhaarNumber}`, {
+      method: "GET",
+      timeoutMs: Math.max(config.REQUEST_TIMEOUT, 45000),
+    });
+
+    const data = await getResponseData(response);
+    if (!response.ok) {
+      return { registered: false, name: null };
+    }
+
+    return {
+      registered: Boolean(data?.registered),
+      name: data?.name || null,
+    };
+  };
+
+  const uploadRegistration = async (capturedUris) => {
+    setLoading(true);
+    try {
+      const formData = new FormData();
+      formData.append("name", name.trim());
+      formData.append("aadhaar", aadhaar);
+
+      REGISTER_EXPRESSIONS.forEach((expression, index) => {
+        formData.append(expression.key, buildImageFormField(capturedUris[index], `${expression.key}.jpg`));
+      });
+
+      const response = await fetchWithTimeout(`${API_BASE}/register`, {
+        method: "POST",
+        body: formData,
+        timeoutMs: config.REGISTER_REQUEST_TIMEOUT,
+      });
+
+      const data = await getResponseData(response);
+
+      if (!response.ok) {
+        const detail = data?.detail || data?.message || "An error occurred.";
+
+        // If backend already has this Aadhaar, keep app state consistent instead of blocking login.
+        if (response.status === 409 && /already registered|in progress|completed/i.test(detail)) {
+          await syncLocalRegistrationCache(aadhaar, name.trim());
+
+          Alert.alert("Already Registered", "This Aadhaar is already registered. You can proceed to verification.", [
+            {
+              text: "OK",
+              onPress: () => {
+                setName("");
+                setAadhaar("");
+                setScreen("auth");
+              },
+            },
+          ]);
+          return;
+        }
+
+        Alert.alert("Registration Failed", detail);
+        return;
+      }
+
+      await syncLocalRegistrationCache(aadhaar, name.trim());
+
+      Alert.alert("Success", "Registration completed with face liveness and fingerprint checks.", [
+        {
+          text: "OK",
+          onPress: () => {
+            setName("");
+            setAadhaar("");
+            setScreen("home");
+          },
+        },
+      ]);
+    } catch (error) {
+      if (error?.name === "AbortError") {
+        try {
+          const status = await checkRegistrationStatus(aadhaar);
+          if (status.registered) {
+            await syncLocalRegistrationCache(aadhaar, status.name || name.trim());
+            Alert.alert("Registration Completed", "Server saved your registration. Proceeding to verification.", [
+              {
+                text: "OK",
+                onPress: () => {
+                  setName("");
+                  setAadhaar("");
+                  setAuthAadhaar(aadhaar);
+                  setScreen("auth");
+                },
+              },
+            ]);
+            return;
+          }
+        } catch (statusError) {
+          // Fall back to timeout message if status check itself fails.
+        }
+
+        Alert.alert("Timeout", "Registration took too long. Please wait a few seconds and try Verify/Login directly.");
+      } else {
+        Alert.alert("Network Error", "Could not connect to server. Please check your connection.");
+      }
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const performFaceAuthenticate = async (aadhaarNumber, imageUris) => {
+    if (!imageUris?.length) {
+      throw new Error("No face captures found for verification.");
+    }
+
+    const formData = new FormData();
+    formData.append("aadhaar", aadhaarNumber);
+
+    const primaryUri = imageUris[imageUris.length - 1];
+    formData.append("image", buildImageFormField(primaryUri, "auth_primary.jpg"));
+
+    imageUris.forEach((uri, index) => {
+      formData.append("liveness_images", buildImageFormField(uri, `liveness_${index}.jpg`));
+    });
+
+    let response = null;
+    let lastError = null;
+
+    for (let attempt = 1; attempt <= config.AUTH_RETRY_ATTEMPTS; attempt += 1) {
+      try {
+        response = await fetchWithTimeout(`${API_BASE}/authenticate`, {
+          method: "POST",
+          body: formData,
+          timeoutMs: config.AUTH_REQUEST_TIMEOUT,
+        });
+        break;
+      } catch (error) {
+        lastError = error;
+        const isAbort = error?.name === "AbortError";
+        if (!isAbort || attempt === config.AUTH_RETRY_ATTEMPTS) {
+          throw error;
+        }
+      }
+    }
+
+    if (!response) {
+      throw lastError || new Error("Authentication request failed");
+    }
+
+    if (!response.ok) {
+      throw new Error(await getErrorMessage(response));
+    }
+
+    return response.json();
+  };
+
+  const completeAuthFlow = async (capturedUris) => {
+    setLoading(true);
+    try {
+      const data = await performFaceAuthenticate(authAadhaar, capturedUris);
+
+      setAuthenticatedUser({ name: data.name || "Voter", aadhaar: authAadhaar });
+      setAuthToken(data.token || "");
+
+      // Keep local cache in sync with backend registration for future offline hints.
+      await syncLocalRegistrationCache(authAadhaar, data.name || "Voter");
+
+      Alert.alert("Verification Success", `Welcome ${data.name || "Voter"}. You can now vote.`, [
+        {
+          text: "Proceed to Vote",
+          onPress: () => setScreen("vote"),
+        },
+      ]);
+    } catch (error) {
+      if (error?.name === "AbortError") {
+        Alert.alert(
+          "Verification Timeout",
+          "Face verification took too long. Please keep good lighting and try again."
+        );
+      } else {
+        Alert.alert("Authentication Failed", error.message || "Face verification failed.");
+      }
+      setScreen("auth");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const completeVoteFlow = async (capturedUris) => {
+    if (!authenticatedUser) {
+      Alert.alert("Error", "Please authenticate first.");
+      setScreen("auth");
+      return;
+    }
+
+    setLoading(true);
+    try {
+      // Re-authenticate with a fresh liveness frame before final vote submission.
+      const freshAuth = await performFaceAuthenticate(authenticatedUser.aadhaar, capturedUris);
+      const tokenToUse = freshAuth.token || authToken;
+
+      const response = await fetchWithTimeout(`${API_BASE}/vote`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${tokenToUse}`,
+        },
+        body: JSON.stringify({ candidate: selectedCandidate }),
+      });
+
+      if (!response.ok) {
+        Alert.alert("Vote Failed", await getErrorMessage(response));
+        setScreen("vote");
+        return;
+      }
+
+      Alert.alert("Vote Recorded", "Your vote was recorded after successful liveness and biometric checks.", [
+        {
+          text: "OK",
+          onPress: () => {
+            setAuthenticatedUser(null);
+            setAuthAadhaar("");
+            setAuthToken("");
+            setSelectedCandidate(CANDIDATES[0]);
+            setScreen("home");
+          },
+        },
+      ]);
+    } catch (error) {
+      Alert.alert("Error", error.message || "Unable to submit vote.");
+      setScreen("vote");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const completeCameraFlow = async (flowType, capturedUris) => {
+    if (flowType === "register") {
+      await uploadRegistration(capturedUris);
+      return;
+    }
+
+    if (flowType === "auth") {
+      await completeAuthFlow(capturedUris);
+      return;
+    }
+
+    if (flowType === "vote") {
+      await completeVoteFlow(capturedUris);
+    }
+  };
+
+  const handleCapture = async () => {
+    if (!cameraFlow) {
+      return;
+    }
+
+    try {
+      const result = await ImagePicker.launchCameraAsync({
+        mediaTypes: ImagePicker.MediaTypeOptions.Images,
+        allowsEditing: false,
+        quality: 0.65,
+      });
+
+      if (result.canceled || !result.assets?.length || !result.assets[0]?.uri) {
+        Alert.alert("Capture Cancelled", "Camera capture was cancelled.");
+        return;
+      }
+
+      const shot = result.assets[0];
+      if (!shot.uri) {
+        Alert.alert("Capture Failed", "Could not capture image. Try again.");
+        return;
+      }
+
+      const optimizedUri = await optimizeCaptureForUpload(shot.uri);
+
+      const updatedUris = [...cameraFlow.capturedUris, optimizedUri];
+
+      if (cameraFlow.stepIndex < cameraFlow.steps.length - 1) {
+        setCameraFlow({ ...cameraFlow, stepIndex: cameraFlow.stepIndex + 1, capturedUris: updatedUris });
+        return;
+      }
+
+      const flowType = cameraFlow.type;
+      setCameraFlow(null);
+      setScreen(flowType === "register" ? "register" : flowType === "auth" ? "auth" : "vote");
+      await completeCameraFlow(flowType, updatedUris);
+    } catch (error) {
+      Alert.alert("Capture Failed", "Unable to capture from camera.");
+    }
+  };
+
+  const cancelCameraFlow = () => {
+    const flowType = cameraFlow?.type;
+    setCameraFlow(null);
+    setScreen(flowType === "register" ? "register" : flowType === "vote" ? "vote" : "auth");
+  };
+
   const handleRegister = async () => {
     if (!name.trim()) {
       Alert.alert("Error", "Please enter your full name.");
@@ -79,63 +472,16 @@ export default function App() {
       return;
     }
 
-    // Authenticate with fingerprint for registration
     const authenticated = await authenticateFingerprint(
       config.FINGERPRINT_PROMPT_MESSAGES.register
     );
-    
+
     if (!authenticated) {
       Alert.alert("Failed", "Fingerprint authentication failed. Registration cancelled.");
       return;
     }
 
-    setLoading(true);
-    try {
-      // Send registration request to backend
-      const response = await fetch(`${API_BASE}/register`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          name: name.trim(),
-          aadhaar: aadhaar,
-        }),
-      });
-
-      const data = await response.json();
-
-      if (!response.ok) {
-        Alert.alert("Registration Failed", data.detail || "An error occurred.");
-        return;
-      }
-
-      // Store fingerprint-aadhaar mapping locally for future authentication
-      await AsyncStorage.setItem(`voter_${aadhaar}`, JSON.stringify({
-        name: name.trim(),
-        aadhaar: aadhaar,
-        registeredAt: new Date().toISOString(),
-      }));
-
-      Alert.alert(
-        "Success",
-        `Registration completed successfully!\n\nName: ${name}\nAadhaar: ${aadhaar}`,
-        [
-          {
-            text: "OK",
-            onPress: () => {
-              setName("");
-              setAadhaar("");
-              setScreen("home");
-            }
-          }
-        ]
-      );
-    } catch (error) {
-      Alert.alert("Network Error", "Could not connect to server. Please check your connection.");
-    } finally {
-      setLoading(false);
-    }
+    await startCameraFlow("register");
   };
 
   const handleAuthenticate = async () => {
@@ -144,67 +490,16 @@ export default function App() {
       return;
     }
 
-    // Check if voter is registered locally
-    const voterData = await AsyncStorage.getItem(`voter_${authAadhaar}`);
-    if (!voterData) {
-      Alert.alert(
-        "Not Registered",
-        "No registration found for this Aadhaar number. Please register first."
-      );
-      return;
-    }
-
-    // Authenticate with fingerprint
     const authenticated = await authenticateFingerprint(
       config.FINGERPRINT_PROMPT_MESSAGES.authenticate
     );
-    
+
     if (!authenticated) {
       Alert.alert("Failed", "Fingerprint authentication failed.");
       return;
     }
 
-    setLoading(true);
-    try {
-      // Verify with backend
-      const response = await fetch(`${API_BASE}/authenticate`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          aadhaar: authAadhaar,
-        }),
-      });
-
-      const data = await response.json();
-
-      if (!response.ok) {
-        Alert.alert("Authentication Failed", data.detail || "An error occurred.");
-        return;
-      }
-
-      const voter = JSON.parse(voterData);
-      setAuthenticatedUser({
-        name: voter.name,
-        aadhaar: authAadhaar,
-      });
-
-      Alert.alert(
-        "Success",
-        `Welcome ${data.name}!\n\nYou can now cast your vote.`,
-        [
-          {
-            text: "Proceed to Vote",
-            onPress: () => setScreen("vote")
-          }
-        ]
-      );
-    } catch (error) {
-      Alert.alert("Network Error", "Could not connect to server. Please check your connection.");
-    } finally {
-      setLoading(false);
-    }
+    await startCameraFlow("auth");
   };
 
   const handleVote = async () => {
@@ -214,68 +509,61 @@ export default function App() {
       return;
     }
 
-    // Confirm with fingerprint before voting
     const authenticated = await authenticateFingerprint(
       config.FINGERPRINT_PROMPT_MESSAGES.vote
     );
-    
+
     if (!authenticated) {
       Alert.alert("Cancelled", "Vote cancelled. Fingerprint authentication failed.");
       return;
     }
 
-    setLoading(true);
-    try {
-      const response = await fetch(`${API_BASE}/vote`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          aadhaar: authenticatedUser.aadhaar,
-          candidate: selectedCandidate,
-        }),
-      });
-
-      const data = await response.json();
-
-      if (!response.ok) {
-        Alert.alert("Vote Failed", data.detail || "An error occurred.");
-        return;
-      }
-
-      Alert.alert(
-        "Vote Recorded",
-        `Thank you for voting!\n\nYour vote has been recorded securely and anonymously.`,
-        [
-          {
-            text: "OK",
-            onPress: () => {
-              setAuthenticatedUser(null);
-              setAuthAadhaar("");
-              setSelectedCandidate(CANDIDATES[0]);
-              setScreen("home");
-            }
-          }
-        ]
-      );
-    } catch (error) {
-      Alert.alert("Network Error", "Could not connect to server. Please check your connection.");
-    } finally {
-      setLoading(false);
-    }
+    await startCameraFlow("vote");
   };
+
+  if (screen === "camera" && cameraFlow) {
+    const activeStep = cameraFlow.steps[cameraFlow.stepIndex];
+    return (
+      <SafeAreaView style={styles.cameraScreenContainer}>
+        <View style={styles.cameraHeader}>
+          <Text style={styles.cameraTitle}>Face Capture</Text>
+          <Text style={styles.cameraSubtitle}>
+            Step {cameraFlow.stepIndex + 1} of {cameraFlow.steps.length}
+          </Text>
+          <Text style={styles.cameraInstruction}>{activeStep?.label}</Text>
+        </View>
+
+        <View style={styles.cameraPlaceholder}>
+          <Text style={styles.cameraPlaceholderText}>
+            Tap "Capture Step" to open your phone camera for this liveness step.
+          </Text>
+        </View>
+
+        <View style={styles.cameraFooter}>
+          <Text style={styles.livenessInfo}>
+            Keep your face clearly visible. Each capture is used for liveness and identity verification.
+          </Text>
+          <TouchableOpacity style={styles.primaryButton} onPress={handleCapture} disabled={loading}>
+            <Text style={styles.primaryButtonText}>Capture Step</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={styles.cancelButton} onPress={cancelCameraFlow} disabled={loading}>
+            <Text style={styles.cancelButtonText}>Cancel</Text>
+          </TouchableOpacity>
+        </View>
+      </SafeAreaView>
+    );
+  }
 
   return (
     <SafeAreaView style={styles.container}>
       <ScrollView contentContainerStyle={styles.content}>
-        <Text style={styles.title}>🗳️ Biometric Voting System</Text>
-        <Text style={styles.subtitle}>Fingerprint-Secured Voting</Text>
+        <Text style={styles.title}>Biometric Voting System</Text>
+        <Text style={styles.subtitle}>Fingerprint + Face Liveness Voting</Text>
 
         {!biometricSupported && (
           <View style={styles.warningCard}>
             <Text style={styles.warningText}>
-              ⚠️ Fingerprint authentication is not available on this device.
+              Fingerprint authentication is not available on this device.
             </Text>
           </View>
         )}
@@ -285,19 +573,19 @@ export default function App() {
             style={[styles.tab, screen === "home" && styles.activeTab]}
             onPress={() => setScreen("home")}
           >
-            <Text style={styles.tabText}>🏠 Home</Text>
+            <Text style={styles.tabText}>Home</Text>
           </TouchableOpacity>
           <TouchableOpacity
             style={[styles.tab, screen === "register" && styles.activeTab]}
             onPress={() => setScreen("register")}
           >
-            <Text style={styles.tabText}>📝 Register</Text>
+            <Text style={styles.tabText}>Register</Text>
           </TouchableOpacity>
           <TouchableOpacity
             style={[styles.tab, screen === "auth" && styles.activeTab]}
             onPress={() => setScreen("auth")}
           >
-            <Text style={styles.tabText}>🔐 Authenticate</Text>
+            <Text style={styles.tabText}>Verify</Text>
           </TouchableOpacity>
           <TouchableOpacity
             style={[styles.tab, screen === "vote" && styles.activeTab]}
@@ -305,7 +593,7 @@ export default function App() {
             disabled={!authenticatedUser}
           >
             <Text style={[styles.tabText, !authenticatedUser && styles.disabledText]}>
-              🗳️ Vote
+              Vote
             </Text>
           </TouchableOpacity>
         </View>
@@ -314,34 +602,33 @@ export default function App() {
           <View style={styles.card}>
             <Text style={styles.cardTitle}>Welcome to Biometric Voting</Text>
             <Text style={styles.cardText}>
-              This secure voting system uses your device's fingerprint sensor to ensure
-              one person, one vote.
+              This app now runs the Python face recognition workflow directly from Android.
             </Text>
             <Text style={styles.cardText}>
-              {"\n"}📱 <Text style={styles.bold}>How it works:</Text>
+              <Text style={styles.bold}>How it works:</Text>
             </Text>
             <Text style={styles.cardText}>
-              1. Register with your Aadhaar number and fingerprint{"\n"}
-              2. Authenticate using your fingerprint{"\n"}
-              3. Cast your vote securely and anonymously
+              1. Register with Aadhaar, fingerprint, and 5 face expressions{"\n"}
+              2. Verify login with fingerprint and live face challenge{"\n"}
+              3. Confirm vote with fingerprint and second liveness challenge
             </Text>
             <Text style={styles.cardText}>
-              {"\n"}🔒 <Text style={styles.bold}>Security Features:</Text>
+              <Text style={styles.bold}>Security Features:</Text>
             </Text>
             <Text style={styles.cardText}>
-              • Fingerprint verification for all actions{"\n"}
-              • Duplicate voter detection{"\n"}
-              • One vote per Aadhaar number{"\n"}
-              • Anonymous vote recording
+              • Face duplicate detection in backend{"\n"}
+              • Challenge-based live face capture{"\n"}
+              • Fingerprint checks for every critical action{"\n"}
+              • One vote per Aadhaar enforced server-side
             </Text>
           </View>
         )}
 
         {screen === "register" && (
           <View style={styles.card}>
-            <Text style={styles.cardTitle}>📝 Voter Registration</Text>
+            <Text style={styles.cardTitle}>Voter Registration</Text>
             <Text style={styles.cardText}>
-              Register as a new voter using your Aadhaar number and fingerprint.
+              Registration includes fingerprint and a 5-step face liveness capture.
             </Text>
 
             <TextInput
@@ -366,7 +653,7 @@ export default function App() {
 
             <View style={styles.infoBox}>
               <Text style={styles.infoText}>
-                👆 You will be prompted to scan your fingerprint after clicking Register.
+                You will scan fingerprint first, then capture neutral, blink, smile, left, and right face images.
               </Text>
             </View>
 
@@ -376,7 +663,7 @@ export default function App() {
               disabled={loading || !biometricSupported}
             >
               <Text style={styles.primaryButtonText}>
-                {loading ? "Registering..." : "Register with Fingerprint"}
+                {loading ? "Registering..." : "Start Registration"}
               </Text>
             </TouchableOpacity>
           </View>
@@ -384,9 +671,9 @@ export default function App() {
 
         {screen === "auth" && (
           <View style={styles.card}>
-            <Text style={styles.cardTitle}>🔐 Voter Authentication</Text>
+            <Text style={styles.cardTitle}>Verification / Login</Text>
             <Text style={styles.cardText}>
-              Authenticate with your Aadhaar number and fingerprint to access the voting portal.
+              Login verification requires Aadhaar, fingerprint, and live face challenge.
             </Text>
 
             <TextInput
@@ -402,7 +689,7 @@ export default function App() {
 
             <View style={styles.infoBox}>
               <Text style={styles.infoText}>
-                👆 You will be prompted to scan your fingerprint for authentication.
+                After fingerprint, complete liveness prompts and capture 3 face frames.
               </Text>
             </View>
 
@@ -412,7 +699,7 @@ export default function App() {
               disabled={loading || !biometricSupported}
             >
               <Text style={styles.primaryButtonText}>
-                {loading ? "Authenticating..." : "Authenticate with Fingerprint"}
+                {loading ? "Authenticating..." : "Verify and Login"}
               </Text>
             </TouchableOpacity>
           </View>
@@ -420,13 +707,13 @@ export default function App() {
 
         {screen === "vote" && (
           <View style={styles.card}>
-            <Text style={styles.cardTitle}>🗳️ Cast Your Vote</Text>
+            <Text style={styles.cardTitle}>Cast Your Vote</Text>
             
             {authenticatedUser ? (
               <>
                 <View style={styles.userInfo}>
                   <Text style={styles.userInfoText}>
-                    ✅ Authenticated as: {authenticatedUser.name}
+                    Authenticated as: {authenticatedUser.name}
                   </Text>
                 </View>
 
@@ -455,7 +742,7 @@ export default function App() {
 
                 <View style={styles.infoBox}>
                   <Text style={styles.infoText}>
-                    👆 You will be prompted to confirm with your fingerprint before submitting.
+                    Final vote submission will run fingerprint + face liveness re-check.
                   </Text>
                 </View>
 
@@ -465,14 +752,14 @@ export default function App() {
                   disabled={loading || !biometricSupported}
                 >
                   <Text style={styles.voteButtonText}>
-                    {loading ? "Submitting Vote..." : "Submit Vote"}
+                    {loading ? "Submitting Vote..." : "Run Liveness and Submit Vote"}
                   </Text>
                 </TouchableOpacity>
               </>
             ) : (
               <View style={styles.notAuthCard}>
                 <Text style={styles.notAuthText}>
-                  ⚠️ Please authenticate first to access the voting portal.
+                  Please verify first to access the voting portal.
                 </Text>
                 <TouchableOpacity
                   style={styles.button}
@@ -490,6 +777,13 @@ export default function App() {
             <ActivityIndicator size="large" color="#0ea5e9" />
           </View>
         )}
+
+        {authenticatedUser?.aadhaar ? (
+          <View style={styles.debugCard}>
+            <Text style={styles.debugText}>Logged in Aadhaar: {authenticatedUser.aadhaar}</Text>
+            <Text style={styles.debugText}>Token active: {authToken ? "Yes" : "No"}</Text>
+          </View>
+        ) : null}
       </ScrollView>
     </SafeAreaView>
   );
@@ -691,5 +985,86 @@ const styles = StyleSheet.create({
   loadingOverlay: {
     alignItems: "center",
     marginVertical: 20,
+  },
+  debugCard: {
+    marginTop: 8,
+    padding: 12,
+    borderRadius: 8,
+    backgroundColor: "#1f2937",
+    borderWidth: 1,
+    borderColor: "#374151",
+  },
+  debugText: {
+    color: "#9ca3af",
+    fontSize: 12,
+  },
+  cameraScreenContainer: {
+    flex: 1,
+    backgroundColor: "#020617",
+    padding: 16,
+  },
+  cameraHeader: {
+    marginBottom: 12,
+  },
+  cameraTitle: {
+    color: "#f8fafc",
+    fontSize: 22,
+    fontWeight: "700",
+    textAlign: "center",
+  },
+  cameraSubtitle: {
+    color: "#94a3b8",
+    fontSize: 14,
+    textAlign: "center",
+    marginTop: 4,
+  },
+  cameraInstruction: {
+    color: "#e2e8f0",
+    fontSize: 16,
+    textAlign: "center",
+    marginTop: 10,
+  },
+  cameraWrapper: {
+    flex: 1,
+    overflow: "hidden",
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: "#334155",
+  },
+  cameraPlaceholder: {
+    flex: 1,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: "#334155",
+    backgroundColor: "#0f172a",
+    alignItems: "center",
+    justifyContent: "center",
+    padding: 20,
+  },
+  cameraPlaceholderText: {
+    color: "#cbd5e1",
+    fontSize: 15,
+    textAlign: "center",
+    lineHeight: 22,
+  },
+  cameraFooter: {
+    marginTop: 14,
+    gap: 10,
+  },
+  livenessInfo: {
+    color: "#cbd5e1",
+    textAlign: "center",
+    fontSize: 13,
+  },
+  cancelButton: {
+    backgroundColor: "#475569",
+    paddingVertical: 12,
+    borderRadius: 8,
+    alignItems: "center",
+  },
+  cancelButtonText: {
+    color: "#f8fafc",
+    fontWeight: "600",
+    fontSize: 15,
   },
 });
