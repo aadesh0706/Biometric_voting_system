@@ -1,0 +1,7 @@
+{"event": "register", "data": {"aadhaar": "898482859615", "name": "Aadesh Gulumbe"}, "time": "2026-03-15T12:28:38.006342Z"}
+{"event": "authenticate", "data": {"aadhaar": "898482859615", "result": "ok", "distance": 0.207100497710359, "liveness_frames": 3}, "time": "2026-03-15T12:35:10.998959Z"}
+{"event": "register_warn", "data": {"aadhaar": "123123123123", "existing_aadhaar": "898482859615", "reason": "invalid_encoding_token"}, "time": "2026-03-15T12:59:55.966578Z"}
+{"event": "register", "data": {"aadhaar": "123123123123", "name": "Aadesh Gulumbe"}, "time": "2026-03-15T12:59:55.973680Z"}
+{"event": "authenticate", "data": {"aadhaar": "123123123123", "result": "ok", "distance": 0.23367287250455027, "liveness_frames": 3}, "time": "2026-03-15T13:00:55.782274Z"}
+{"event": "authenticate", "data": {"aadhaar": "123123123123", "result": "ok", "distance": 0.2199837031324315, "liveness_frames": 3}, "time": "2026-03-15T13:01:25.379364Z"}
+{"event": "vote", "data": {"aadhaar": "123123123123", "candidate": "Candidate A"}, "time": "2026-03-15T13:01:25.449096Z"}
