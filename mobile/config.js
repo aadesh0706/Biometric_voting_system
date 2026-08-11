@@ -5,7 +5,7 @@ export const config = {
   // Backend API Configuration
   // For Android Emulator, use: http://10.0.2.2:8000
   // For real device, use your computer's IP address (find with 'ipconfig' command)
-  API_BASE_URL: "http://10.167.94.85:8000",
+  API_BASE_URL: "http://10.111.242.85:8000",
 
   // App Configuration
   APP_NAME: "Biometric Voting",
